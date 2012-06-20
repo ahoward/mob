@@ -1,25 +1,42 @@
 # encoding: utf-8
 module Mob
-  class Script
+  class CLI
   ##
   #
-    attr_reader(:name)
-
     attr_accessor(:file)
-    attr_accessor(:script)
+    attr_accessor(:env)
+    attr_accessor(:argv)
+    attr_accessor(:stdin)
+    attr_accessor(:stdout)
+    attr_accessor(:stderr)
+
+
+    attr_reader(:name)
+    attr_reader(:root)
+
     attr_accessor(:worker)
     attr_accessor(:block)
     attr_accessor(:cmdline)
     attr_accessor(:signals)
 
-    def initialize(file, options = {}, &block)
+    def initialize(file, env = ENV, argv = ARGV, stdin = STDIN, stdout = STDOUT, stderr = STDERR)
       @file = file.to_s
+      @env = env.to_hash.dup
+      @argv = Array(argv).map{|arg| arg.dup}
+
+      @stdin = stdin
+      @stdout = stdout
+      @stderr = stderr
+
       @name = File.basename(@file)
-      @block = block
-      @cmd = cmdline_for(ARGV)
-      @started_at = Time.now
-      @signals = []
-      @sleeping = false
+
+      @root = Mob.root
+
+      #@block = block
+      #@cmd = cmdline_for(ARGV)
+      #@started_at = Time.now
+      #@signals = []
+      #@sleeping = false
     end
 
     def worker
@@ -27,13 +44,11 @@ module Mob
     end
 
     def name=(name)
-      @name = name.to_s
-      @worker = Worker.for(@name)
-      @name
+      @worker = Worker.for(@name = name.to_s)
     end
 
     def run(argv = ARGV)
-      Dir.chdir(Rails.root)
+      Dir.chdir(Mob.root)
 
       STDOUT.sync = true
       STDERR.sync = true
@@ -67,8 +82,6 @@ module Mob
       redirect_io!
 
       trap!
-
-      signal_if_redeployed!
 
       log!
 
@@ -146,8 +159,8 @@ module Mob
     end
 
     def log!
-        logger.debug("START - #{ worker_identifier }")
-        logger.debug("CMD   - #{ @cmd }")
+      logger.debug("START - #{ worker_identifier }")
+      logger.debug("CMD   - #{ @cmd }")
 
       at_exit do
         logger.debug("STOP - #{ Process.pid }") rescue nil
@@ -193,7 +206,7 @@ module Mob
     def redirect_io!
       stdin, stdout, stderr =
         %w( stdin stdout stderr ).map do |basename|
-          path = File.join(Rails.root, 'tmp', 'mob', @name, basename)
+          path = File.join(Mob.tmp, @name, basename)
           FileUtils.mkdir_p(File.dirname(path))
           path
         end
@@ -378,34 +391,6 @@ module Mob
       nil
     end
 
-    def signal_if_redeployed!
-      seconds = Rails.env.production? ? 10 : 1
-
-      Thread.new do
-        Thread.current.abort_on_exception = true
-
-        loop do
-          Kernel.sleep(seconds)
-
-          if redeployed?
-            logger.debug("REDEPLOYED - #{ Process.pid }")
-            Process.kill('USR1', Process.pid)
-          end
-        end
-      end
-    end
-
-    def redeployed?
-      restart_txt = current_path_for(File.join(Rails.root, 'tmp/restart.txt'))
-      t = File.stat(restart_txt).mtime rescue @started_at
-      if t > @started_at
-        @started_at = t
-        true
-      else
-        false
-      end
-    end
-
     def cmdline_for(argv)
       script = current_path_for(file)
       [Mob.which_ruby, script, *argv].join(' ')
@@ -415,19 +400,8 @@ module Mob
       path.to_s.gsub(%r|\breleases/\d+\b|, 'current')
     end
 
-    def loggers
-      @loggers ||= Hash.new do |hash, pid|
-        tty_loggers = {
-          true  => Mob::Logger.new(::Logger.new(STDERR), :prefix => "Mob[#{ @name }]"),
-          false => Mob::Logger.new(Rails.logger, :prefix => "Mob[#{ @name }]")
-        }
-        hash.update(pid => tty_loggers)
-      end
-    end
-
     def logger
-      loggers[Process.pid]
-      loggers[Process.pid][STDOUT.tty?]
+      @logger ||= Mob::Logger.new(::Logger.new(STDERR), :prefix => "Mob[#{ @worker.name }]")
     end
   end
 end

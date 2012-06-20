@@ -39,7 +39,7 @@ module Mob
     validates_presence_of(:name)
     validates_uniqueness_of(:name)
 
-    index(:name, :unique => true)
+    index({:name => 1}, {:unique => true})
 
     def work(&block)
       Mob::Job.run(:locked_by => name) do |job|

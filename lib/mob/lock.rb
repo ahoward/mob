@@ -17,18 +17,18 @@ module Mob
         target_class.lock_class = lock_class
 
         lock_class.class_eval do
+          define_method(:target_class){ target_class }
+          define_method(:lock_class){ lock_class }
+
           include Mongoid::Document
           include Mongoid::Timestamps
 
-          field(:hostname, :default => proc{ ::Lock.hostname })
-          field(:ppid, :default => proc{ ::Lock.ppid })
-          field(:pid, :default => proc{ ::Lock.pid })
+          field(:hostname, :default => proc{ ::Mob::Lock.hostname })
+          field(:ppid, :default => proc{ ::Mob::Lock.ppid })
+          field(:pid, :default => proc{ ::Mob::Lock.pid })
 
           attr_accessor :stolen
-
-          def stolen?
-            stolen
-          end
+          alias_method :stolen?, :stolen
 
           def initialize(*args, &block)
             super
@@ -40,12 +40,45 @@ module Mob
           end
 
           def localhost?
-            ::Lock.hostname == hostname
+            ::Mob::Lock.hostname == hostname
           end
 
           def alive?
             return true unless localhost?
-            ::Lock.alive?(ppid, pid)
+            ::Mob::Lock.alive?(ppid, pid)
+          end
+
+          def relock!
+            reload
+
+            conditions = {
+              '_lock._id'      => id,
+              '_lock.hostname' => hostname,
+              '_lock.ppid'     => ppid,
+              '_lock.pid'      => pid
+            }
+
+            update = {
+              '$set' => {
+                '_lock.hostname'   => ::Mob::Lock.hostname,
+                '_lock.ppid'       => ::Mob::Lock.ppid,
+                '_lock.pid'        => ::Mob::Lock.pid,
+                '_lock.updated_at' => Time.now.utc
+              }
+            }
+
+            result =
+                target_class.
+                  with(safe: true).
+                    where(conditions).
+                      find_and_modify(update, new: false)
+
+          ensure
+            reload
+          end
+
+          def steal!
+            self.stolen = !!relock!
           end
 
           def stale?
@@ -53,7 +86,7 @@ module Mob
           end
 
           def owner?
-            ::Lock.identifier == identifier
+            ::Mob::Lock.identifier == identifier
           end
 
           def identifier
@@ -71,50 +104,37 @@ module Mob
 
       ## locking methods
       #
-        def target_class.lock!(query = {}, update = {}, options = {})
-          query.to_options!
+        def target_class.lock!(conditions = {}, update = {})
+          conditions.to_options!
           update.to_options!
-          options.to_options!
 
-          query[:_lock] = nil
+          conditions[:_lock] = nil
 
           update[:$set] = {:_lock => lock_class.new.attributes}
 
-          options[:safe] = true
-          options[:new] = true
-
-          begin
-            collection.find_and_modify(
-              :query => query,
-              :update => update,
-              :options => options
-            )
-          rescue Object => e
-            nil
-          end
+          with(safe: true).
+            where(conditions).
+              find_and_modify(update, new: true)
         end
 
         def lock!(conditions = {})
-          stolen = false
+          conditions.to_options!
+
           begin
-            if _lock and _lock.stale?
-              _lock.destroy
-              stolen = true
+            if _lock and _lock.stale? and _lock.steal!
+              return _lock
             end
           rescue
             nil
           end
 
-          conditions.to_options!
           conditions[:_id] = id
 
           if self.class.lock!(conditions)
             reload
 
             begin
-              _lock and _lock.owner?
-              _lock.stolen = stolen
-              @locked = _lock
+              @locked = _lock && _lock.owner?
             rescue
               nil
             end
@@ -125,6 +145,7 @@ module Mob
 
         def unlock!
           unlocked = false
+
           if _lock
             begin
               _lock.destroy if _lock.owner?
@@ -133,30 +154,17 @@ module Mob
             rescue
               nil
             end
+
             reload
           end
+
           unlocked
         end
 
         def relock!
-          raise(::Lock::Error, "#{ name } is not locked!") unless @locked
+          raise(::Mob::Lock::Error, "#{ name } is not locked!") unless @locked
 
-          relocked = false
-          if _lock
-            begin
-              _lock.update_attributes!(
-                :updated_at => Time.now.utc,
-                :hostname => ::Lock.hostname,
-                :ppid => ::Lock.ppid,
-                :pid => ::Lock.pid
-              )
-              relocked = true
-            rescue
-              nil
-            end
-            reload
-          end
-          relocked
+          _lock.relock!
         end
 
         def locked?
@@ -184,7 +192,7 @@ module Mob
             else
               if options[:blocking] == false
                 if block
-                  raise(::Lock::Error, name)
+                  raise(::Mob::Lock::Error, name)
                 else
                   return(false)
                 end
@@ -243,9 +251,11 @@ module Mob
   ##
   #
     field(:name)
+
     validates_presence_of(:name)
     validates_uniqueness_of(:name)
-    index(:name, :unique => true)
+
+    index({:name => 1}, {:unique => true})
 
   ##
   #

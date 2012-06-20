@@ -1,0 +1,16 @@
+#! /usr/bin/env ruby
+
+Mob.worker do |worker|
+  worker.run
+end
+
+p worker.name
+
+
+BEGIN {
+  begin
+    require_relative '../lib/mob.rb'
+  rescue LoadError
+    require 'mob'
+  end
+}

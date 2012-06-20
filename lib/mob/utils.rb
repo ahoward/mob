@@ -1,12 +1,12 @@
 # encoding: utf-8
 module Mob
-  def script(options = {}, &block)
+  def worker(options = {}, &block)
     file = options[:file] || options['file']
     file ||= eval('File.expand_path(__FILE__)', block.binding)
-    script = Script.new(file, options, &block)
+    cli = CLI.new(file, ENV, ARGV, STDIN, STDOUT, STDERR)
     name = (options[:name] || options['name'] || :worker).to_s
-    script.name = name.to_s
-    script.run(ARGV)
+    cli.name = name.to_s
+    cli.run!
   end
 
   def callbacks
@@ -37,6 +37,31 @@ module Mob
     else
       list.reverse.each{|block| block.call}
     end
+  end
+
+  def root
+    defined?(Rails.root) && Rails.root ? Rails.root : Dir.pwd
+  end
+
+  class Env < ::String
+    def method_missing(method, *args, &block)
+      super unless method.to_s =~ /\A(.*)\?\Z/
+      self == $1
+    end
+  end
+
+  def env
+    defined?(Rails.env) && Rails.env ? Rails.env : Env.new(ENV['RAILS_ENV'] || ENV['MOB_ENV'])
+  end
+
+  def tmp
+    @tmp ||= (
+      if defined?(Rails.root) && Rails.root
+        File.join(Rails.root, 'tmp', 'mob')
+      else
+        Dir.tmpdir
+      end
+    )
   end
 
   def cap?(&block)
@@ -108,6 +133,18 @@ module Mob
       JSON.parse(string) unless string.nil?
     end
   end
+
+  def plain_old_data(object)
+    case object
+      when nil
+        nil
+      when Hash, Array
+        Mob.json_load(Mob.json_dump(object))
+      else
+        Mob.json_load(Mob.json_dump({:_ => object}))
+    end
+  end
+  alias_method(:pod, :plain_old_data)
 
   extend(Mob)
 end

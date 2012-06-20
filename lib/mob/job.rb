@@ -13,55 +13,53 @@ module Mob
     Job.run(*args, &block)
   end
 
+##
+#
   class Job
   ##
   #
     include ::Mongoid::Document
     include ::Mongoid::Timestamps
 
-    class Literal
-      include Mongoid::Fields::Serializable
-
-      def serialize(object) object.to_s unless object.nil? end
-      def deserialize(string) eval(string) unless string.nil? end
-    end
-
-    class Serialized
-      include Mongoid::Fields::Serializable
-
-      def serialize(object) Mob.json_dump(object) end
-      def deserialize(string) Mob.json_load(string) end
+  ##
+  #
+    before_save do |job|
+      job.normalize!
     end
 
   ##
   #
-    field(:job, :type => Literal)
-    field(:args, :type => Serialized)
-    field(:result, :type => Serialized, :default => nil)
-    field(:error, :type => Hash, :default => nil)
+    field(:receiver, :type => String, :default => 'Kernel')
+    field(:message, :type => String, :default => 'eval')
+    field(:args)
+    field(:result)
+    field(:error)
 
     field(:run_at, :type => Time, :default => proc{ Time.now.utc })
-    field(:completed_at, :type => Time, :default => nil)
+    field(:completed_at, :type => Time)
     field(:attempts, :type => Integer, :default => 0)
 
-    field(:locked_by, :type => String, :default => nil)
-    field(:locked_at, :type => String, :default => nil)
+    field(:locked_by, :type => String)
+    field(:locked_at, :type => String)
 
   ##
   #
-    validates_presence_of(:job)
+    validates_presence_of(:receiver)
+    validates_presence_of(:message)
     validates_presence_of(:args)
     validates_presence_of(:run_at)
     validates_presence_of(:attempts)
 
   ##
   #
-    index(:job)
-    index(:created_at)
-    index(:locked_by)
-    index(:locked_at)
-    index(:completed_at)
-    index(:attempts)
+    index({:receiver => 1})
+    index({:message => 1})
+    index({:created_at => 1})
+    index({:locked_by => 1})
+    index({:locked_at => 1})
+    index({:run_at => 1})
+    index({:completed_at => 1})
+    index({:attempts => 1})
 
   ##
   #
@@ -76,35 +74,36 @@ module Mob
     def Job.make!(*args, &block)
       args.compact!
       attributes = {}
-      attributes[:job] = "::#{ args.shift }" unless args.empty?
+      attributes[:receiver] = args.shift.to_s unless args.empty?
+      attributes[:message] = args.shift.to_s unless args.empty?
       attributes[:args] = args
       create!(attributes)
     end
 
     def Job.purge!(max = 8192)
-      current_count = Job.count
-
-      if current_count > max
+      if Job.count > max
         where(:completed_at.lt => 1.minute.ago).
           delete_all
       end
 
-      if current_count > max
+      if Job.count > max
         where(:attempts.gt => 4).
           delete_all
       end
       
-      where(:completed_at.lt => 1.week.ago).
-        delete_all
+      if Job.count > max
+        where(:completed_at.lt => 1.week.ago).
+          delete_all
+      end
     end
 
     def Job.run(options = {}, &block)
       Job.purge!
 
       locked_by = (
-        options[:locked_by] || options['locked_by'] || 
-        options[:as] || options['as'] ||
-        'worker'
+        options[:locked_by] || options['locked_by'] ||
+        options[:as]        || options['as']        ||
+        'mob'
       ).to_s
 
       now = Time.now.utc
@@ -132,23 +131,26 @@ module Mob
 
         update = {
           '$set' => {
-            :locked_by  => locked_by,
-            :locked_at  => now,
-            :updated_at => now
+            'locked_by'  => locked_by,
+            'locked_at'  => now,
+            'updated_at' => now
           }
         }
 
-        result =
-          collection.find_and_modify(
-            :query  => query,
-            :sort   => sort,
-            :update => update
-          )
+        jobs = where(query)
 
-        break unless result
+        break unless jobs.count > 0
 
-        job = instantiate(result)
+        job =
+          with(:safe => true).
+            where(query).
+              order_by(sort).
+                find_and_modify(update)
+
+        break unless job
+
         n += 1
+
         job.run
 
         block.call(job) if block
@@ -158,68 +160,69 @@ module Mob
     end
 
     def run
-      self.class.collection.find_and_modify(
-        :query => {
-          :_id => id
-        },
-        :update => {
-          '$set' => {
-            :attempts => (attempts + 1)
-          }
-        }
-      )
+      inc(:attempts, 1)
 
       begin
-        result = job.perform(*args)
-        now = Time.now.utc
-        result = Mob.json_dump(result)
+        job = eval(receiver, TOPLEVEL_BINDING)
 
-        self.class.collection.find_and_modify(
-          :query => {
-            :_id => id
-          },
-          :update => {
-            '$set' => {
-              :result       => result,
-              :completed_at => now,
-              :updated_at   => now,
-              :locked_by    => nil,
-              :locked_at    => nil
-            }
-          }
+        result = job.send(message, *args)
+
+        now    = Time.now.utc
+        result = Mob.pod(result)
+
+        update_attributes!(
+          'result'       => result,
+          'completed_at' => now,
+          'updated_at'   => now,
+          'locked_by'    => nil,
+          'locked_at'    => nil
         )
       rescue Object => e
         now = Time.now.utc
 
         error = {
           'message'   => e.message.to_s,
-          'class'     => e.class.name,
+          'class'     => e.class.name.to_s,
           'backtrace' => (e.backtrace || [])
         }
 
-        later = now + 60
+        later = now + ((2 ** [attempts - 1, 10].min) * 60)
 
-        self.class.collection.find_and_modify(
-          :query => {
-            :_id => id
-          },
-          :update => {
-            '$set' => {
-              :error      => error,
-              :run_at     => later,
-              :updated_at => now,
-              :locked_by  => nil,
-              :locked_at  => nil
-            }
-          }
+        update_attributes!(
+          'error'      => error,
+          'run_at'     => later,
+          'updated_at' => now,
+          'locked_by'  => nil,
+          'locked_at'  => nil
         )
       end
 
       reload
     end
 
+    def normalize!
+      tap do |job|
+        job.receiver = job.receiver.to_s unless job.receiver.nil?
+        job.message = job.message.to_s unless job.message.nil?
+
+        job.args = Mob.pod(job.args) unless job.args.nil?
+        job.result = Mob.pod(job.result) unless job.result.nil?
+        job.error = Mob.pod(job.error) unless job.error.nil?
+      end
+    end
+
+    def Job.field_names
+      @field_names ||= fields.map{|name, *_| name}
+    end
+
+    def to_hash
+      hash = {}
+      Job.field_names.each{|field| hash[field] = self[field]}
+      hash
+    end
+
     def inspect
-      PP.pp(self.attributes, '')
+      PP.pp(to_hash, '')
     end
   end
 end
